@@ -1,0 +1,464 @@
+(
+    targetText as nullable text,
+    SearchPhrase1 as list,
+    optional ReturnPhrase1 as nullable list,
+    optional Conversion1 as nullable list,
+    
+    optional Threshold1 as nullable number,
+    optional SearchDirection1 as nullable text,
+    
+    optional SearchPhrase2 as nullable list,
+    optional ReturnPhrase2 as nullable list,
+    optional Conversion2 as nullable list,
+    
+    optional Threshold2 as nullable number,
+    optional SearchDirection2 as nullable text
+) as nullable record =>
+let
+    // Early exit if targetText is null
+    output =
+      if targetText = null then
+          null
+      else
+          let
+              // --------------------------------------------------
+              // Global settings and basic normalization (for fuzzy matching only)
+              // --------------------------------------------------
+              actualThreshold1 = if Threshold1 <> null then Threshold1 else 0.5,
+              actualThreshold2 = if Threshold2 <> null then Threshold2 else 0.5,
+              direction1 = if SearchDirection1 <> null then Text.Trim(SearchDirection1) else "left",
+              direction2 = if SearchDirection2 <> null then Text.Trim(SearchDirection2) else "left",
+              // For fuzzy matching we normalize the text; extraction preserves original casing.
+              NormalizeText = (txt as text) as text => Text.Lower(Text.Trim(txt)),
+              normTargetText = NormalizeText(targetText),
+              normTargetLength = Text.Length(normTargetText),
+              
+              // --------------------------------------------------
+              // Utility Functions (mostly unchanged)
+              // --------------------------------------------------
+              FnTextBeforeSecondDelimiterIgnoreCase = (inputText as text, delim1 as text, optional delim2 as nullable text) as nullable text =>
+                  let
+                      lowerText = Text.Lower(inputText),
+                      delim2Actual = if delim2 = null or delim2 = "" then null else delim2,
+                      result =
+                          if delim2Actual = null then
+                              inputText
+                          else
+                              let
+                                  lowerDelim1 = Text.Lower(delim1),
+                                  lowerDelim2 = Text.Lower(delim2Actual),
+                                  firstPos1 = Text.PositionOf(lowerText, lowerDelim1),
+                                  firstPos2 = Text.PositionOf(lowerText, lowerDelim2),
+                                  firstPos =
+                                      if firstPos1 = -1 then firstPos2
+                                      else if firstPos2 = -1 then firstPos1
+                                      else List.Min({firstPos1, firstPos2}),
+                                  remainingText =
+                                      if firstPos <> -1 then Text.Range(inputText, firstPos + 1) else null,
+                                  resultText =
+                                      if remainingText <> null then
+                                          let
+                                              lowerRemaining = Text.Lower(remainingText),
+                                              secondPos1 = Text.PositionOf(lowerRemaining, lowerDelim1),
+                                              secondPos2 = Text.PositionOf(lowerRemaining, lowerDelim2),
+                                              secondPos =
+                                                  if secondPos1 = -1 then secondPos2
+                                                  else if secondPos2 = -1 then secondPos1
+                                                  else List.Min({secondPos1, secondPos2}),
+                                              secondDelim =
+                                                  if secondPos1 <> -1 and (secondPos1 <= secondPos2 or secondPos2 = -1)
+                                                  then delim1 else delim2Actual,
+                                              secondPosFull =
+                                                  if secondPos <> -1 then firstPos + 1 + secondPos else -1
+                                          in
+                                              if secondPosFull <> -1 then Text.Start(inputText, secondPosFull + Text.Length(secondDelim)) else null
+                                      else
+                                          null
+                              in
+                                  resultText
+                  in
+                      result,
+                      
+              // We use the entire source text for dynamic extraction.
+              GetWindowedText = (source as text, phrase as nullable text, window as number) as text => source,
+              
+              Levenshtein = (s as text, t as text) as number =>
+                  let
+                      sLen = Text.Length(s),
+                      tLen = Text.Length(t),
+                      sList = Text.ToList(s),
+                      tList = Text.ToList(t),
+                      initRow = List.Transform({0..tLen}, each _),
+                      finalRow = List.Accumulate(
+                          {1..sLen},
+                          initRow,
+                          (prevRow, i) =>
+                              List.Accumulate(
+                                  {1..tLen},
+                                  {i},
+                                  (row, j) =>
+                                      let
+                                          cost = if sList{i - 1} = tList{j - 1} then 0 else 1,
+                                          deletion = row{j - 1} + 1,
+                                          insertion = prevRow{j} + 1,
+                                          substitution = prevRow{j - 1} + cost,
+                                          minVal = List.Min({deletion, insertion, substitution})
+                                      in
+                                          row & {minVal}
+                              )
+                      )
+                  in
+                      finalRow{tLen},
+              
+              // --------------------------------------------------
+              // NEW HELPER: GetNumericPortion
+              // --------------------------------------------------
+              // Uses a simple regex to extract the first number from a string.
+              GetNumericPortion = (txt as text) as nullable text =>
+                  let
+                      numMatch = try RegexMatch(txt, "^[+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10[-+]?\d+))?") otherwise null,
+                      numText = if numMatch <> null and List.Count(numMatch) > 0 then numMatch{0} else ""
+                  in
+                      Text.Trim(numText),
+              
+              // --------------------------------------------------
+              // NEW HELPER: GetRangeFromExtractedText
+              // --------------------------------------------------
+              // If the extracted text contains a number range indicated by a hyphen, en dash, or em dash (excluding "±"),
+              // return the range as "number1-number2".
+              GetRangeFromExtractedText = (extractedText as text) as nullable text =>
+                  let
+                      Cleaned = Text.Trim(extractedText),
+                      pattern = "([+-]?\d+(?:[.,]\d+)?)[\s]*[-–—][\s]*([+-]?\d+(?:[.,]\d+)?)",
+                      match = try RegexMatch(Cleaned, pattern, "i") otherwise null
+                  in
+                      if match <> null and List.Count(match) > 2 then match{1} & "-" & match{2} else null,
+              
+              // --------------------------------------------------
+              // NEW HELPER: DeriveValueAndRange
+              // --------------------------------------------------
+              // Given the full extracted text, do the following:
+              // 1. If the text contains "±", split on it.
+              //    Use GetNumericPortion on both parts to get the main value and uncertainty.
+              //    Then compute the range as (main value - uncertainty) & "-" & (main value + uncertainty).
+              // 2. Otherwise, simply extract the first number and attempt to get a range via GetRangeFromExtractedText.
+              // If the text is scientific, force the range to null.
+              DeriveValueAndRange = (fullText as text) as record =>
+                  let
+                      hasPlusMinus = Text.Contains(fullText, "±"),
+                      provisional =
+                        if hasPlusMinus then
+                          let
+                              mainValText = GetNumericPortion(Text.Trim(Text.BeforeDelimiter(fullText, "±"))),
+                              uncertaintyText = GetNumericPortion(Text.Trim(Text.AfterDelimiter(fullText, "±"))),
+                              mainVal = NormalizeFinalNumber(mainValText),
+                              uncertaintyVal = NormalizeFinalNumber(uncertaintyText),
+                              rangeText = 
+                                if mainVal <> null and uncertaintyVal <> null then 
+                                  Number.ToText(mainVal - uncertaintyVal) & "-" & Number.ToText(mainVal + uncertaintyVal)
+                                else 
+                                  null,
+                              extractedValue = if mainVal <> null then Text.From(mainVal) else null
+                          in
+                              [ ExtractedValue = extractedValue, ExtractedRange = rangeText, ExtractedNumber = mainVal ]
+                        else
+                          let
+                              valText = GetNumericPortion(fullText),
+                              mainVal = NormalizeFinalNumber(valText),
+                              rangeText = GetRangeFromExtractedText(fullText)
+                          in
+                              [ ExtractedValue = valText, ExtractedRange = rangeText, ExtractedNumber = mainVal ],
+                      // For scientific values, force range to null.
+                      finalRange = if IsScientificText(fullText) then null else provisional[ExtractedRange]
+                  in
+                      [ ExtractedValue = provisional[ExtractedValue],
+                        ExtractedRange = finalRange,
+                        ExtractedNumber = provisional[ExtractedNumber] ],
+              
+              // --------------------------------------------------
+              // NEW DYNAMIC EXTRACTION FUNCTION:
+              // Build a regex dynamically using a base numeric pattern and the unit.
+              // The regex now optionally matches a range using either a dash-like delimiter or "±".
+              // A positive lookahead ensures the unit is followed by whitespace or the end-of-string.
+              // --------------------------------------------------
+              ExtractFullTextFromSource = (source as text, phrase as nullable text, optional direction as text) as nullable text =>
+                  let
+                      Cleaned = Text.Trim(Text.Replace(Text.Replace(source, "#(lf)", " "), ",", "")),
+                      p = if phrase = null then null else Text.Trim(phrase),
+                      // Base pattern for a single number
+                      baseNumberPattern = "[+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10[-+]?\d+))?",
+                      // Build an optional range pattern: capture first number, then optionally match a delimiter ([-–—] or ±) and a second number.
+                      rangePattern = "(" & baseNumberPattern & ")(?:\s*(?:[-–—]|±)\s*(" & baseNumberPattern & "))?",
+                      pattern = rangePattern & "[ \t]*" & p & "(?=[ \t]|$)",
+                      match = try RegexMatch(Cleaned, pattern, "i") otherwise null,
+                      fullText = if match <> null and List.Count(match) > 0 then match{0} else null
+                  in
+                      fullText,
+              
+              // --------------------------------------------------
+              // GetRangeTextFromSource is now used within DeriveValueAndRange.
+              // --------------------------------------------------
+              IsScientificText = (txt as text) as logical =>
+                  let
+                      CleanText = Text.Trim(txt),
+                      Indicators = {"e-", "e+", "×10-", "× 10-", "*10-", "* 10-", "x10-", "x 10-", " x10-", " x10-", "^10-", "^ 10-"}
+                  in
+                      List.AnyTrue(List.Transform(Indicators, each Text.Contains(CleanText, _))),
+              
+              TextAfterIgnoreCase = (inputText as text, delimiter as text) as nullable text =>
+                  let
+                      lowerText = Text.Lower(inputText),
+                      lowerDelimiter = Text.Lower(delimiter),
+                      pos = Text.PositionOf(lowerText, lowerDelimiter)
+                  in
+                      if pos <> -1 then Text.Range(inputText, pos + Text.Length(delimiter)) else null,
+              
+              FuzzyMatch = (
+                  sourceText as text,
+                  searchList as list,
+                  optional returnList as nullable list,
+                  optional threshold as nullable number
+              ) as record =>
+                  let
+                      actualThreshold = if threshold <> null then threshold else 0.5,
+                      zippedList =
+                          if returnList <> null and List.Count(searchList) = List.Count(returnList) then
+                              List.Transform(List.Zip({searchList, returnList}), each [SearchPhraseOriginal = _{0}, ReturnedPhrase = _{1}])
+                          else
+                              List.Transform(searchList, each [SearchPhraseOriginal = _, ReturnedPhrase = _]),
+                      normText = normTargetText,
+                      textLength = normTargetLength,
+                      slidingPhrases = (searchPhrase as text) as list =>
+                          let
+                              sLen = Text.Length(searchPhrase),
+                              rangePositions = {0..(textLength - sLen)},
+                              windows = List.Transform(rangePositions, (i) => [
+                                  before = if i = 0 then null else Text.Middle(normText, i - 1, 1),
+                                  match = Text.Middle(normText, i, sLen),
+                                  after = if i + sLen >= textLength then null else Text.Middle(normText, i + sLen, 1)
+                              ]),
+                              isLetter = (c as nullable text) as logical =>
+                                  if c = null then false else List.Contains({"a".."z", "A".."Z"}, c),
+                              boundaryWindows = List.Select(windows, each
+                                  let
+                                      b = _[before],
+                                      a = _[after],
+                                      startOkay = b = null or not isLetter(b),
+                                      endOkay = a = null or not isLetter(a)
+                                  in
+                                      startOkay and endOkay
+                              )
+                          in
+                              List.Transform(boundaryWindows, each _[match]),
+                      TestPhrase = (searchPhrase as text) as record =>
+                          let
+                              possiblePhrases = slidingPhrases(searchPhrase),
+                              scored = List.Transform(possiblePhrases, (phrase) =>
+                                  let
+                                      dist = Levenshtein(phrase, searchPhrase),
+                                      maxLen = List.Max({Text.Length(phrase), Text.Length(searchPhrase)}),
+                                      similarity = if maxLen = 0 then 1 else 1 - (dist / maxLen)
+                                  in
+                                      [SearchedPhrase = searchPhrase, MatchedPhrase = phrase, Similarity = similarity]
+                              ),
+                              good = List.Select(scored, each _[Similarity] >= actualThreshold),
+                              best = if List.Count(good) = 0 then
+                                          [SearchedPhrase = null, MatchedPhrase = null, Similarity = null]
+                                     else
+                                          let
+                                              maxSim = List.Max(List.Transform(good, each _[Similarity])),
+                                              top = List.First(List.Select(good, each _[Similarity] = maxSim))
+                                          in
+                                              top
+                          in
+                              best,
+                      AllMatches = List.Transform(zippedList, (rec) =>
+                          let
+                              origPhrase = rec[SearchPhraseOriginal],
+                              normalizedPhrase = NormalizeText(origPhrase),
+                              combinedPhrase = Text.Replace(normalizedPhrase, " ", ""),
+                              baseResult = TestPhrase(normalizedPhrase),
+                              combinedResult = TestPhrase(combinedPhrase),
+                              FinalBest =
+                                  if baseResult[Similarity] = null and combinedResult[Similarity] = null then
+                                      [SearchedPhrase = null, MatchedPhrase = null, ReturnedPhrase = rec[ReturnedPhrase], Similarity = null]
+                                  else if baseResult[Similarity] = null then
+                                      [SearchedPhrase = normalizedPhrase, MatchedPhrase = combinedResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = combinedResult[Similarity]]
+                                  else if combinedResult[Similarity] = null then
+                                      [SearchedPhrase = normalizedPhrase, MatchedPhrase = baseResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = baseResult[Similarity]]
+                                  else if baseResult[Similarity] >= combinedResult[Similarity] then
+                                      [SearchedPhrase = normalizedPhrase, MatchedPhrase = baseResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = baseResult[Similarity]]
+                                  else
+                                      [SearchedPhrase = normalizedPhrase, MatchedPhrase = combinedResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = combinedResult[Similarity]]
+                          in
+                              FinalBest
+                      ),
+                      ValidMatches = List.Select(AllMatches, each _[Similarity] <> null),
+                      FinalBest =
+                          if List.Count(ValidMatches) = 0 then
+                              [SearchedPhrase = null, MatchedPhrase = null, ReturnedPhrase = null, Similarity = null]
+                          else
+                              let
+                                  topScore = List.Max(List.Transform(ValidMatches, each _[Similarity])),
+                                  topMatch = List.First(List.Select(ValidMatches, each _[Similarity] = topScore))
+                              in
+                                  topMatch
+                  in
+                      FinalBest,
+              
+              NormalizeFinalNumber = (valueText as nullable text) as nullable number =>
+                  let
+                      raw = if valueText = null then null else Text.Trim(valueText),
+                      parts =
+                          if raw <> null and Text.Contains(raw, "10") and List.AnyTrue({Text.Contains(raw, "×"), Text.Contains(raw, "x"), Text.Contains(raw, "*")})
+                          then
+                              let
+                                  separators = {"×", "*", "x"},
+                                  found = List.First(List.Select(separators, each Text.Contains(raw, _)), null),
+                                  split1 = if found <> null then Text.Split(raw, found) else {raw},
+                                  mainPart = if List.Count(split1) = 2 then Text.Trim(split1{0}) else raw,
+                                  split2 = if List.Count(split1) = 2 then Text.Split(Text.Trim(split1{1}), "10") else {},
+                                  exponent = if List.Count(split2) = 2 then Text.Trim(split2{1}) else null,
+                                  recombined = if exponent <> null then mainPart & "e" & exponent else raw
+                              in
+                                  recombined
+                          else
+                              raw,
+                      sciCleaned = Text.Replace(Text.Replace(Text.Replace(Text.Replace(Text.Replace(parts, "×", "e"), "x10^", "e"), "*10^", "e"), "*10", "e"), " x10", "e"),
+                      cleaned = if Text.Contains(sciCleaned, ",") and not Text.Contains(sciCleaned, ".")
+                                then Text.Replace(Text.Remove(sciCleaned, {" "}), ",", ".")
+                                else Text.Replace(Text.Remove(sciCleaned, {" "}), ",", ""),
+                      asNumber = try Number.FromText(cleaned) otherwise null
+                  in
+                      asNumber,
+              
+              FnLookupInLists = (
+                  param1 as any,
+                  param2 as nullable text,
+                  SearchUnitList as list,
+                  ReturnUnitList as list,
+                  ConversionList as list
+              ) as record =>
+                  let
+                      position = if param2 <> null then List.PositionOf(ReturnUnitList, param2) else -1,
+                      Result =
+                          if param2 = null then
+                              [Found = false, Message = "Null parameter", ConvertedValue = null]
+                          else if position = -1 then
+                              [Found = false, Message = "No match found for: " & param2, ConvertedValue = null]
+                          else
+                              let
+                                  searchUnit = SearchUnitList{position},
+                                  returnUnit = ReturnUnitList{position},
+                                  conversion = ConversionList{position},
+                                  conversionTry = try Number.From(conversion),
+                                  convertedValue =
+                                      if param1 = null then null
+                                      else if conversionTry[HasError] then
+                                          try Expression.Evaluate(Text.Replace(Text.From(conversion), "x", Number.ToText(param1)), [x = param1]) otherwise null
+                                      else if conversionTry[Value] = 1 then param1
+                                      else param1 * conversionTry[Value]
+                              in
+                                  [Found = true, SearchUnit = searchUnit, ReturnUnit = returnUnit, Conversion = conversion, ConvertedValue = convertedValue]
+                  in
+                      Result,
+              
+              // --------------------------------------------------
+              // Modified Extraction Block for Phrase 1:
+              // Derive ExtractedText via the dynamic regex and then derive ExtractedValue and ExtractedRange (via DeriveValueAndRange) from it.
+              // If scientific (as determined by the full text), range extraction is skipped.
+              // --------------------------------------------------
+              ExtractValueBlock1 = (source as text, matchRec as record) as record =>
+                  if matchRec[MatchedPhrase] = null then
+                      [ ExtractedText = null, ExtractedValue = null, IsScientific = null, ExtractedRange = null, ExtractedNumber = null, ConvertedNumber = null ]
+                  else
+                      let
+                          phraseToExtract = matchRec[MatchedPhrase],
+                          fullText = ExtractFullTextFromSource(targetText, phraseToExtract, "left"),
+                          valueAndRange = if fullText <> null then DeriveValueAndRange(fullText) else [ExtractedValue = null, ExtractedRange = null, ExtractedNumber = null],
+                          newValue = valueAndRange[ExtractedValue],
+                          num = valueAndRange[ExtractedNumber],
+                          rangeText = valueAndRange[ExtractedRange],
+                          isSci = if num <> null then IsScientificText(fullText) else false
+                      in
+                          if num = null then
+                              [ ExtractedText = fullText, ExtractedValue = newValue, IsScientific = isSci, ExtractedRange = rangeText, ExtractedNumber = num, ConvertedNumber = null ]
+                          else
+                              let
+                                  converted = if ReturnPhrase1 <> null and Conversion1 <> null and matchRec[ReturnedPhrase] <> null then
+                                                  FnLookupInLists(num, matchRec[ReturnedPhrase], SearchPhrase1, ReturnPhrase1, Conversion1)
+                                              else [ConvertedValue = null]
+                              in
+                              [ ExtractedText = fullText, ExtractedValue = newValue, IsScientific = isSci, ExtractedRange = rangeText, ExtractedNumber = num, ConvertedNumber = converted[ConvertedValue] ],
+              
+              // --------------------------------------------------
+              // Modified Extraction Block for Phrase 2:
+              // Similarly, derive values from the full extracted text.
+              // --------------------------------------------------
+              ExtractValueBlock2 = (source as text, matchRec as record) as record =>
+                  if matchRec[MatchedPhrase] = null then
+                      [ ExtractedText = null, ExtractedValue = null, IsScientific = null, ExtractedRange = null, ExtractedNumber = null, ConvertedNumber = null ]
+                  else
+                      let
+                          phraseToExtract = matchRec[ReturnedPhrase],
+                          fullText = ExtractFullTextFromSource(targetText, phraseToExtract, "left"),
+                          valueAndRange = if fullText <> null then DeriveValueAndRange(fullText) else [ExtractedValue = null, ExtractedRange = null, ExtractedNumber = null],
+                          newValue = valueAndRange[ExtractedValue],
+                          num = valueAndRange[ExtractedNumber],
+                          rangeText = valueAndRange[ExtractedRange],
+                          isSci = if num <> null then IsScientificText(fullText) else false
+                      in
+                          if num = null then
+                              [ ExtractedText = fullText, ExtractedValue = newValue, IsScientific = isSci, ExtractedRange = rangeText, ExtractedNumber = num, ConvertedNumber = null ]
+                          else
+                              let
+                                  converted = if ReturnPhrase2 <> null and Conversion2 <> null and matchRec[ReturnedPhrase] <> null then
+                                                  FnLookupInLists(num, matchRec[ReturnedPhrase], SearchPhrase2, ReturnPhrase2, Conversion2)
+                                               else [ConvertedValue = null]
+                              in
+                              [ ExtractedText = fullText, ExtractedValue = newValue, IsScientific = isSci, ExtractedRange = rangeText, ExtractedNumber = num, ConvertedNumber = converted[ConvertedValue] ],
+              
+              // --------------------------------------------------
+              // MAIN MATCH & EXTRACTION PROCESS
+              // --------------------------------------------------
+              match1 = FuzzyMatch(targetText, SearchPhrase1, ReturnPhrase1, Threshold1),
+              match2 = if SearchPhrase2 <> null then FuzzyMatch(targetText, SearchPhrase2, ReturnPhrase2, Threshold2)
+                       else [SearchedPhrase = null, MatchedPhrase = null, ReturnedPhrase = null, Similarity = null],
+              trimmedText = FnTextBeforeSecondDelimiterIgnoreCase(targetText, match1[MatchedPhrase], match2[MatchedPhrase]),
+              ValueBlock1 = ExtractValueBlock1(trimmedText, match1),
+              ValueBlock2 =
+                  if SearchPhrase2 = null or match2[MatchedPhrase] = null then
+                      [ ExtractedText = null, ExtractedValue = null, IsScientific = null, ExtractedRange = null, ExtractedNumber = null, ConvertedNumber = null ]
+                  else
+                      ExtractValueBlock2(targetText, match2),
+              finalResult =
+                  if match1[MatchedPhrase] = null or ValueBlock1[ExtractedNumber] = null then
+                      null
+                  else
+                      [
+                          SearchedPhrase1 = match1[SearchedPhrase],
+                          MatchedPhrase1 = match1[MatchedPhrase],
+                          ReturnedPhrase1 = match1[ReturnedPhrase],
+                          Similarity1 = match1[Similarity],
+                          ExtractedText1 = ValueBlock1[ExtractedText],
+                          ExtractedValue1 = ValueBlock1[ExtractedValue],
+                          IsScientific1 = ValueBlock1[IsScientific],
+                          ExtractedRange1 = ValueBlock1[ExtractedRange],
+                          ExtractedNumber1 = ValueBlock1[ExtractedNumber],
+                          ConvertedNumber1 = ValueBlock1[ConvertedNumber],
+                          
+                          SearchedPhrase2 = match2[SearchedPhrase],
+                          MatchedPhrase2 = match2[MatchedPhrase],
+                          ReturnedPhrase2 = match2[ReturnedPhrase],
+                          Similarity2 = match2[Similarity],
+                          ExtractedText2 = ValueBlock2[ExtractedText],
+                          ExtractedValue2 = ValueBlock2[ExtractedValue],
+                          IsScientific2 = ValueBlock2[IsScientific],
+                          ExtractedRange2 = ValueBlock2[ExtractedRange],
+                          ExtractedNumber2 = ValueBlock2[ExtractedNumber],
+                          ConvertedNumber2 = ValueBlock2[ConvertedNumber]
+                      ]
+          in
+              finalResult
+in
+    output
