@@ -153,11 +153,7 @@ let
                               uncertaintyText = GetNumericPortion(Text.Trim(Text.AfterDelimiter(fullText, "±"))),
                               mainVal = NormalizeFinalNumber(mainValText),
                               uncertaintyVal = NormalizeFinalNumber(uncertaintyText),
-                              rangeText = 
-                                if mainVal <> null and uncertaintyVal <> null then 
-                                  Number.ToText(mainVal - uncertaintyVal) & "-" & Number.ToText(mainVal + uncertaintyVal)
-                                else 
-                                  null,
+                              rangeText = if mainVal <> null and uncertaintyVal <> null then Number.ToText(mainVal - uncertaintyVal) & "-" & Number.ToText(mainVal + uncertaintyVal) else null,
                               extractedValue = if mainVal <> null then Text.From(mainVal) else null
                           in
                               [ ExtractedValue = extractedValue, ExtractedRange = rangeText, ExtractedNumber = mainVal ]
@@ -168,7 +164,6 @@ let
                               rangeText = GetRangeFromExtractedText(fullText)
                           in
                               [ ExtractedValue = valText, ExtractedRange = rangeText, ExtractedNumber = mainVal ],
-                      // For scientific values, force range to null.
                       finalRange = if IsScientificText(fullText) then null else provisional[ExtractedRange]
                   in
                       [ ExtractedValue = provisional[ExtractedValue],
@@ -177,9 +172,9 @@ let
               
               // --------------------------------------------------
               // NEW DYNAMIC EXTRACTION FUNCTION:
-              // Build a regex dynamically using a base numeric pattern and the unit.
-              // The regex now optionally matches a range using either a dash-like delimiter or "±".
-              // A positive lookahead ensures the unit is followed by whitespace or the end-of-string.
+              // We build a regex dynamically without using lookahead to avoid unsupported constructs.
+              // Instead, we match the number/range followed by optional whitespace and the provided unit,
+              // then use post-match cleanup to trim extra punctuation.
               // --------------------------------------------------
               ExtractFullTextFromSource = (source as text, phrase as nullable text, optional direction as text) as nullable text =>
                   let
@@ -187,16 +182,22 @@ let
                       p = if phrase = null then null else Text.Trim(phrase),
                       // Base pattern for a single number
                       baseNumberPattern = "[+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10[-+]?\d+))?",
-                      // Build an optional range pattern: capture first number, then optionally match a delimiter ([-–—] or ±) and a second number.
+                      // Optional range pattern: captures one or two numbers
                       rangePattern = "(" & baseNumberPattern & ")(?:\s*(?:[-–—]|±)\s*(" & baseNumberPattern & "))?",
-                      pattern = rangePattern & "[ \t]*" & p & "(?=[ \t]|$)",
+                      // Build the pattern without using lookahead since it's unsupported.
+                      pattern = rangePattern & "[ \t]*" & p,
                       match = try RegexMatch(Cleaned, pattern, "i") otherwise null,
-                      fullText = if match <> null and List.Count(match) > 0 then match{0} else null
+                      fullText = if match <> null and List.Count(match) > 0 then match{0} else null,
+                      // Helper to trim unwanted trailing characters (like *, ], ), .)
+                      TrimTrailingCharacters = (s as text, unwanted as list) as text =>
+                          if s = "" then ""
+                          else if List.Contains(unwanted, Text.End(s, 1)) then @TrimTrailingCharacters(Text.Start(s, Text.Length(s)-1), unwanted) else s,
+                      cleanedFullText = if fullText <> null then TrimTrailingCharacters(fullText, {"*", "]", ")", "."}) else null
                   in
-                      fullText,
+                      cleanedFullText,
               
               // --------------------------------------------------
-              // GetRangeTextFromSource is now used within DeriveValueAndRange.
+              // Utility: Determines if the text is scientific based on common indicators.
               // --------------------------------------------------
               IsScientificText = (txt as text) as logical =>
                   let
@@ -365,7 +366,7 @@ let
               
               // --------------------------------------------------
               // Modified Extraction Block for Phrase 1:
-              // Derive ExtractedText via the dynamic regex and then derive ExtractedValue and ExtractedRange (via DeriveValueAndRange) from it.
+              // Derive ExtractedText via the dynamic regex then derive ExtractedValue and ExtractedRange (via DeriveValueAndRange) from it.
               // If scientific (as determined by the full text), range extraction is skipped.
               // --------------------------------------------------
               ExtractValueBlock1 = (source as text, matchRec as record) as record =>
