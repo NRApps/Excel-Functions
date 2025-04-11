@@ -2,14 +2,18 @@
     targetText as nullable text,
     SearchPhrase1 as list,
     ReturnPhrase1 as nullable list,
+    Conversion1 as list,
+    
+    
     SearchPhrase2 as nullable list,
     ReturnPhrase2 as nullable list,
-    Conversion1 as list,
     Conversion2 as list,
+    
     optional Threshold1 as nullable number,
     optional Threshold2 as nullable number,
     optional SearchDirection1 as nullable text,
     optional SearchDirection2 as nullable text
+
 ) as nullable record =>
 if targetText = null then 
     null 
