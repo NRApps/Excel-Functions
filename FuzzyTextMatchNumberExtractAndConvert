@@ -12,149 +12,158 @@
     optional SearchDirection2 as nullable text
 ) as nullable record =>
 let
-    // ***************** Fuzzy Phrase Matching Block (fnFuzzyPhraseMatch) *****************
-    fuzzyMatchResult = 
-        if targetText = null then 
-            null 
-        else
-            let
-                // Normalize target text for fuzzy matching
-                NormalizeText = (txt as text) as text => Text.Lower(Text.Trim(txt)),
-                normTargetText = NormalizeText(targetText),
-                normTargetLength = Text.Length(normTargetText),
-                
-                // Levenshtein distance function
-                Levenshtein = (s as text, t as text) as number =>
-                    let
-                        sLen = Text.Length(s),
-                        tLen = Text.Length(t),
-                        sList = Text.ToList(s),
-                        tList = Text.ToList(t),
-                        initRow = List.Transform({0..tLen}, each _),
-                        finalRow = List.Accumulate(
-                            {1..sLen},
-                            initRow,
-                            (prevRow, i) =>
-                                List.Accumulate(
-                                    {1..tLen},
-                                    {i},
-                                    (row, j) =>
-                                        let
-                                            cost = if sList{i - 1} = tList{j - 1} then 0 else 1,
-                                            deletion = row{j - 1} + 1,
-                                            insertion = prevRow{j} + 1,
-                                            substitution = prevRow{j - 1} + cost,
-                                            minVal = List.Min({deletion, insertion, substitution})
-                                        in
-                                            row & {minVal}
-                                )
-                        )
-                    in
-                        finalRow{tLen},
-                
-                // Fuzzy match function (using normalized target)
-                FuzzyMatch = (sourceText as text, searchList as list, optional returnList as nullable list, optional threshold as nullable number) as record =>
-                    let
-                        actualThreshold = if threshold <> null then threshold else 0.51,
-                        zippedList =
-                            if returnList <> null and List.Count(searchList) = List.Count(returnList) then
-                                List.Transform(List.Zip({searchList, returnList}), each [SearchPhraseOriginal = _{0}, ReturnedPhrase = _{1}])
-                            else
-                                List.Transform(searchList, each [SearchPhraseOriginal = _, ReturnedPhrase = _]),
-                        normText = normTargetText,
-                        textLength = normTargetLength,
-                        slidingPhrases = (searchPhrase as text) as list =>
-                            let
-                                sLen = Text.Length(searchPhrase),
-                                rangePositions = {0..(textLength - sLen)},
-                                windows = List.Transform(rangePositions, (i) => [
-                                    before = if i = 0 then null else Text.Middle(normText, i - 1, 1),
-                                    match = Text.Middle(normText, i, sLen),
-                                    after = if i + sLen >= textLength then null else Text.Middle(normText, i + sLen, 1)
-                                ]),
-                                isLetter = (c as nullable text) as logical =>
-                                    if c = null then false else List.Contains({"a".."z", "A".."Z"}, c),
-                                boundaryWindows = List.Select(windows, each
+// ***************** Fuzzy Phrase Matching Block (fnFuzzyPhraseMatch) *****************
+fuzzyMatchResult = 
+    if targetText = null then 
+        null 
+    else
+        let
+            // Normalize target text for fuzzy matching; also keep the original text.
+            NormalizeText = (txt as text) as text => Text.Lower(Text.Trim(txt)),
+            normTargetText = NormalizeText(targetText),
+            originalText = Text.Trim(targetText),
+            normTargetLength = Text.Length(normTargetText),
+            
+            // Levenshtein distance function (unchanged)
+            Levenshtein = (s as text, t as text) as number =>
+                let
+                    sLen = Text.Length(s),
+                    tLen = Text.Length(t),
+                    sList = Text.ToList(s),
+                    tList = Text.ToList(t),
+                    initRow = List.Transform({0..tLen}, each _),
+                    finalRow = List.Accumulate(
+                        {1..sLen},
+                        initRow,
+                        (prevRow, i) =>
+                            List.Accumulate(
+                                {1..tLen},
+                                {i},
+                                (row, j) =>
                                     let
-                                        b = _[before],
-                                        a = _[after],
-                                        startOkay = b = null or not isLetter(b),
-                                        endOkay = a = null or not isLetter(a)
+                                        cost = if sList{i - 1} = tList{j - 1} then 0 else 1,
+                                        deletion = row{j - 1} + 1,
+                                        insertion = prevRow{j} + 1,
+                                        substitution = prevRow{j - 1} + cost,
+                                        minVal = List.Min({deletion, insertion, substitution})
                                     in
-                                        startOkay and endOkay
-                                )
-                            in
-                                List.Transform(boundaryWindows, each _[match]),
-                        TestPhrase = (searchPhrase as text) as record =>
-                            let
-                                possiblePhrases = slidingPhrases(searchPhrase),
-                                scored = List.Transform(possiblePhrases, (phrase) =>
-                                    let
-                                        dist = Levenshtein(phrase, searchPhrase),
-                                        maxLen = List.Max({Text.Length(phrase), Text.Length(searchPhrase)}),
-                                        similarity = if maxLen = 0 then 1 else 1 - (dist / maxLen)
-                                    in
-                                        [SearchedPhrase = searchPhrase, MatchedPhrase = phrase, Similarity = similarity]
-                                ),
-                                good = List.Select(scored, each _[Similarity] >= actualThreshold),
-                                best = if List.Count(good) = 0 then
-                                            [SearchedPhrase = null, MatchedPhrase = null, Similarity = null]
-                                       else
-                                            let
-                                                maxSim = List.Max(List.Transform(good, each _[Similarity])),
-                                                top = List.First(List.Select(good, each _[Similarity] = maxSim))
-                                            in
-                                                top
-                            in
-                                best,
-                        AllMatches = List.Transform(zippedList, (rec) =>
-                            let
-                                origPhrase = rec[SearchPhraseOriginal],
-                                normalizedPhrase = NormalizeText(origPhrase),
-                                combinedPhrase = Text.Replace(normalizedPhrase, " ", ""),
-                                baseResult = TestPhrase(normalizedPhrase),
-                                combinedResult = TestPhrase(combinedPhrase),
-                                FinalBest =
-                                    if baseResult[Similarity] = null and combinedResult[Similarity] = null then
-                                        [SearchedPhrase = null, MatchedPhrase = null, ReturnedPhrase = rec[ReturnedPhrase], Similarity = null]
-                                    else if baseResult[Similarity] = null then
-                                        [SearchedPhrase = normalizedPhrase, MatchedPhrase = combinedResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = combinedResult[Similarity]]
-                                    else if combinedResult[Similarity] = null then
-                                        [SearchedPhrase = normalizedPhrase, MatchedPhrase = baseResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = baseResult[Similarity]]
-                                    else if baseResult[Similarity] >= combinedResult[Similarity] then
-                                        [SearchedPhrase = normalizedPhrase, MatchedPhrase = baseResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = baseResult[Similarity]]
-                                    else
-                                        [SearchedPhrase = normalizedPhrase, MatchedPhrase = combinedResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = combinedResult[Similarity]]
-                            in
-                                FinalBest
-                        ),
-                        ValidMatches = List.Select(AllMatches, each _[Similarity] <> null),
-                        FinalBest = if List.Count(ValidMatches) = 0 then
-                                        [SearchedPhrase = null, MatchedPhrase = null, ReturnedPhrase = null, Similarity = null]
-                                    else
+                                        row & {minVal}
+                            )
+                    )
+                in
+                    finalRow{tLen},
+            
+            // Fuzzy match function (using normalized target)
+            FuzzyMatch = (sourceText as text, searchList as list, optional returnList as nullable list, optional threshold as nullable number) as record =>
+                let
+                    actualThreshold = if threshold <> null then threshold else 0.51,
+                    zippedList =
+                        if returnList <> null and List.Count(searchList) = List.Count(returnList) then
+                            List.Transform(List.Zip({searchList, returnList}), each [SearchPhraseOriginal = _{0}, ReturnedPhrase = _{1}])
+                        else
+                            List.Transform(searchList, each [SearchPhraseOriginal = _, ReturnedPhrase = _]),
+                    normText = normTargetText,
+                    textLength = normTargetLength,
+                    
+                    // Modified slidingPhrases: create a record with both normalized and original text candidates.
+                    slidingPhrases = (searchPhrase as text) as list =>
+                        let
+                            sLen = Text.Length(searchPhrase),
+                            rangePositions = {0..(textLength - sLen)},
+                            windows = List.Transform(rangePositions, (i) => [
+                                before = if i = 0 then null else Text.Middle(normText, i - 1, 1),
+                                matchNorm = Text.Middle(normText, i, sLen),
+                                matchOrig = Text.Middle(originalText, i, sLen),
+                                after = if i + sLen >= textLength then null else Text.Middle(normText, i + sLen, 1)
+                            ]),
+                            isLetter = (c as nullable text) as logical =>
+                                if c = null then false else List.Contains({"a".."z", "A".."Z"}, c),
+                            boundaryWindows = List.Select(windows, each
+                                let
+                                    b = _[before],
+                                    a = _[after],
+                                    startOkay = b = null or not isLetter(b),
+                                    endOkay = a = null or not isLetter(a)
+                                in
+                                    startOkay and endOkay
+                            )
+                        in
+                            boundaryWindows,
+                    
+                    // Modified TestPhrase: Compare using normalized text; return the original candidate.
+                    TestPhrase = (searchPhrase as text) as record =>
+                        let
+                            possiblePhrases = slidingPhrases(searchPhrase),
+                            scored = List.Transform(possiblePhrases, (candidate) =>
+                                let
+                                    candNorm = candidate[matchNorm],
+                                    candOrig = candidate[matchOrig],
+                                    dist = Levenshtein(candNorm, NormalizeText(searchPhrase)),
+                                    maxLen = List.Max({Text.Length(candNorm), Text.Length(NormalizeText(searchPhrase))}),
+                                    similarity = if maxLen = 0 then 1 else 1 - (dist / maxLen)
+                                in
+                                    [SearchedPhrase = searchPhrase, MatchedPhrase = candOrig, Similarity = similarity]
+                            ),
+                            good = List.Select(scored, each _[Similarity] >= actualThreshold),
+                            best = if List.Count(good) = 0 then
+                                        [SearchedPhrase = null, MatchedPhrase = null, Similarity = null]
+                                   else
                                         let
-                                            topScore = List.Max(List.Transform(ValidMatches, each _[Similarity])),
-                                            topMatch = List.First(List.Select(ValidMatches, each _[Similarity] = topScore))
+                                            maxSim = List.Max(List.Transform(good, each _[Similarity])),
+                                            top = List.First(List.Select(good, each _[Similarity] = maxSim))
                                         in
-                                            topMatch
-                    in
-                        FinalBest,
-                // Get fuzzy match results for both search phrases
-                match1 = FuzzyMatch(targetText, SearchPhrase1, ReturnPhrase1, Threshold1),
-                match2 = if SearchPhrase2 <> null then FuzzyMatch(targetText, SearchPhrase2, ReturnPhrase2, Threshold2)
-                         else [SearchedPhrase = null, MatchedPhrase = null, ReturnedPhrase = null, Similarity = null],
-                finalFuzzyResult = [
-                    SearchedPhrase1 = match1[SearchedPhrase],
-                    MatchedPhrase1 = match1[MatchedPhrase],
-                    ReturnedPhrase1 = match1[ReturnedPhrase],
-                    Similarity1 = match1[Similarity],
-                    SearchedPhrase2 = match2[SearchedPhrase],
-                    MatchedPhrase2 = match2[MatchedPhrase],
-                    ReturnedPhrase2 = match2[ReturnedPhrase],
-                    Similarity2 = match2[Similarity]
-                ]
-            in
-                finalFuzzyResult,
+                                            top
+                        in
+                            best,
+                    
+                    AllMatches = List.Transform(zippedList, (rec) =>
+                        let
+                            origPhrase = rec[SearchPhraseOriginal],
+                            normalizedPhrase = NormalizeText(origPhrase),
+                            combinedPhrase = Text.Replace(normalizedPhrase, " ", ""),
+                            baseResult = TestPhrase(normalizedPhrase),
+                            combinedResult = TestPhrase(combinedPhrase),
+                            FinalBest =
+                                if baseResult[Similarity] = null and combinedResult[Similarity] = null then
+                                    [SearchedPhrase = null, MatchedPhrase = null, ReturnedPhrase = rec[ReturnedPhrase], Similarity = null]
+                                else if baseResult[Similarity] = null then
+                                    [SearchedPhrase = normalizedPhrase, MatchedPhrase = combinedResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = combinedResult[Similarity]]
+                                else if combinedResult[Similarity] = null then
+                                    [SearchedPhrase = normalizedPhrase, MatchedPhrase = baseResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = baseResult[Similarity]]
+                                else if baseResult[Similarity] >= combinedResult[Similarity] then
+                                    [SearchedPhrase = normalizedPhrase, MatchedPhrase = baseResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = baseResult[Similarity]]
+                                else
+                                    [SearchedPhrase = normalizedPhrase, MatchedPhrase = combinedResult[MatchedPhrase], ReturnedPhrase = rec[ReturnedPhrase], Similarity = combinedResult[Similarity]]
+                        in
+                            FinalBest
+                    ),
+                    ValidMatches = List.Select(AllMatches, each _[Similarity] <> null),
+                    FinalBest = if List.Count(ValidMatches) = 0 then
+                                    [SearchedPhrase = null, MatchedPhrase = null, ReturnedPhrase = null, Similarity = null]
+                                else
+                                    let
+                                        topScore = List.Max(List.Transform(ValidMatches, each _[Similarity])),
+                                        topMatch = List.First(List.Select(ValidMatches, each _[Similarity] = topScore))
+                                    in
+                                        topMatch
+                in
+                    FinalBest,
+            // Get fuzzy match results for both search phrases
+            match1 = FuzzyMatch(targetText, SearchPhrase1, ReturnPhrase1, Threshold1),
+            match2 = if SearchPhrase2 <> null then FuzzyMatch(targetText, SearchPhrase2, ReturnPhrase2, Threshold2)
+                     else [SearchedPhrase = null, MatchedPhrase = null, ReturnedPhrase = null, Similarity = null],
+            finalFuzzyResult = [
+                SearchedPhrase1 = match1[SearchedPhrase],
+                MatchedPhrase1 = match1[MatchedPhrase],
+                ReturnedPhrase1 = match1[ReturnedPhrase],
+                Similarity1 = match1[Similarity],
+                SearchedPhrase2 = match2[SearchedPhrase],
+                MatchedPhrase2 = match2[MatchedPhrase],
+                ReturnedPhrase2 = match2[ReturnedPhrase],
+                Similarity2 = match2[Similarity]
+            ]
+        in
+            finalFuzzyResult,
 
 // ***************** Fuzzy Extraction Block (fnFuzzyExtract) *****************
 fuzzyExtractResult =
