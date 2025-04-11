@@ -11,6 +11,9 @@
     optional SearchDirection1 as nullable text,
     optional SearchDirection2 as nullable text
 ) as nullable record =>
+if targetText = null then 
+    null 
+else
 let
 // ***************** Fuzzy Phrase Matching Block (fnFuzzyPhraseMatch) *****************
 fuzzyMatchResult = 
