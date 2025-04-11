@@ -189,7 +189,7 @@ fuzzyExtractResult =
             // Extract the numeric portion anchored at the beginning (for left extraction).
             GetNumericPortion = (txt as text) as nullable text =>
                 let
-                    numMatch = try RegexMatch(txt, "^[+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?") otherwise null,
+                    numMatch = try RegexMatch(txt, "^[+-]?\s*\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?") otherwise null,
                     numText = if numMatch <> null and List.Count(numMatch) > 0 then numMatch{0} else ""
                 in
                     Text.Trim(numText),
@@ -198,7 +198,7 @@ fuzzyExtractResult =
             GetNumericPortionRight = (txt as text) as nullable text =>
                 let
                     cleanedText = Text.Trim(txt),
-                    numMatch = try RegexMatch(cleanedText, "[+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?") otherwise null,
+                    numMatch = try RegexMatch(cleanedText, "[-+]?\s*\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?") otherwise null,
                     numText = if numMatch <> null and List.Count(numMatch) > 0 then numMatch{0} else ""
                 in
                     Text.Trim(numText),
@@ -208,7 +208,7 @@ fuzzyExtractResult =
             GetRangeFromExtractedText = (extractedText as text) as nullable text =>
                 let
                     Cleaned = Text.Trim(extractedText),
-                    pattern = "([+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)[\s]*[-–—][\s]*([+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)",
+                    pattern = "([-+]?\s*\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)[\s]*[-–—][\s]*([+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)",
                     match = try RegexMatch(Cleaned, pattern, "i") otherwise null
                 in
                     if match <> null and List.Count(match) > 2 then match{1} & "-" & match{2} else null,
@@ -253,25 +253,13 @@ fuzzyExtractResult =
             
             // ----- Extraction Helper Using Hardcoded Regex Patterns -----
             // This helper uses literal, hardcoded regex patterns.
-            // REGEX FOR LEFT OF PHRASE MATCH (DEFAULT)
-            // Numeric part comes first then the phrase.
-            // ([+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)
-            // (?:\s*(?:[-–—]|±)\s*([+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?))?
-            // [ \t]*(\[)?
-            // {phrase}
-            //
-            // REGEX FOR RIGHT OF PHRASE MATCH
-            // The phrase comes first then the numeric part.
-            // {phrase}
-            // ([+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)
-            // (?:\s*(?:[-–—]|±)\s*([+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?))?
-            // [ \t]*(\[)?
+
             ExtractFullTextFromSource = (source as text, phrase as nullable text, optional direction as text) as nullable record =>
                 let
                     Cleaned = Text.Trim(Text.Replace(Text.Replace(source, "#(lf)", " "), ",", "")),
                     p = if phrase = null then null else Text.Trim(phrase),
-                    leftPattern = "([+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)(?:\s*(?:[-–—]|±)\s*([+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?))?[ \t]*(\[)?" & p,
-                    rightPattern = p & ".*?([+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)(?:\s*(?:[-–—]|±)\s*([+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?))?[ \t]*(\[)?",
+                    leftPattern = "([-+]?\s*\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)(?:\s*(?:[-–—]|±)\s*([+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?))?[ \t]*(\[)?" & p,
+                    rightPattern = p & ".*?([-+]?\s*\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)(?:\s*(?:[-–—]|±)\s*([+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?))?[ \t]*(\[)?",
                     actualDirection = if direction <> null then Text.Lower(Text.Trim(direction)) else "left",
                     pattern = if actualDirection = "right" then rightPattern else leftPattern,
                     match = try RegexMatch(Cleaned, pattern, "i") otherwise null,
