@@ -156,169 +156,170 @@ let
             in
                 finalFuzzyResult,
 
-    // ***************** Fuzzy Extraction Block (fnFuzzyExtract) *****************
-    fuzzyExtractResult =
-        if targetText = null then
-            null
-        else
-            let
-                // Cleaning Block: Remove unwanted characters from targetText.
-                UnwantedChars = { Character.FromNumber(160) },
-                CleanTargetText = Text.Remove(targetText, UnwantedChars),
-                
-                // Define default search directions if not provided
-                direction1 = if SearchDirection1 <> null then Text.Trim(SearchDirection1) else "left",
-                direction2 = if SearchDirection2 <> null then Text.Trim(SearchDirection2) else "left",
-                
-                // Helper: Extract the first number using a regex.
-                GetNumericPortion = (txt as text) as nullable text =>
+// ***************** Fuzzy Extraction Block (fnFuzzyExtract) *****************
+fuzzyExtractResult =
+    if targetText = null then
+        null
+    else
+        let
+            // Cleaning Block: Remove unwanted characters from targetText.
+            UnwantedChars = { Character.FromNumber(160) },
+            CleanTargetText = Text.Remove(targetText, UnwantedChars),
+            
+            // Define default search directions if not provided
+            direction1 = if SearchDirection1 <> null then Text.Trim(SearchDirection1) else "left",
+            direction2 = if SearchDirection2 <> null then Text.Trim(SearchDirection2) else "left",
+            
+            // Helper: Extract the first number using a regex.
+            GetNumericPortion = (txt as text) as nullable text =>
+                let
+                    numMatch = try RegexMatch(txt, "^[+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?") otherwise null,
+                    numText = if numMatch <> null and List.Count(numMatch) > 0 then numMatch{0} else ""
+                in
+                    Text.Trim(numText),
+            
+            // Helper: If the text contains a range then return it as "number1-number2".
+            GetRangeFromExtractedText = (extractedText as text) as nullable text =>
+                let
+                    Cleaned = Text.Trim(extractedText),
+                    pattern = "([+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)[\s]*[-–—][\s]*([+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)",
+                    match = try RegexMatch(Cleaned, pattern, "i") otherwise null
+                in
+                    if match <> null and List.Count(match) > 2 then match{1} & "-" & match{2} else null,
+            
+            // Helper: Normalize a number that may be expressed in scientific notation.
+            NormalizeFinalNumber = (valueText as nullable text) as nullable number =>
+                let
+                    raw = if valueText = null then null else Text.Trim(valueText),
+                    rawNoCaret = if raw <> null then Text.Replace(raw, "^", "") else raw,
+                    parts =
+                        if rawNoCaret <> null and Text.Contains(rawNoCaret, "10") and List.AnyTrue({Text.Contains(rawNoCaret, "×"), Text.Contains(rawNoCaret, "x"), Text.Contains(rawNoCaret, "*")})
+                        then
+                            let
+                                separators = {"×", "*", "x"},
+                                found = List.First(List.Select(separators, each Text.Contains(rawNoCaret, _)), null),
+                                split1 = if found <> null then Text.Split(rawNoCaret, found) else {rawNoCaret},
+                                mainPart = if List.Count(split1) = 2 then Text.Trim(split1{0}) else rawNoCaret,
+                                split2Raw = if List.Count(split1) = 2 then Text.Trim(split1{1}) else "",
+                                split2Clean = Text.Replace(split2Raw, "^", ""),
+                                split2 = Text.Split(split2Clean, "10"),
+                                exponent = if List.Count(split2) = 2 then Text.Trim(split2{1}) else null,
+                                recombined = if exponent <> null then mainPart & "e" & exponent else rawNoCaret
+                            in
+                                recombined
+                        else
+                            rawNoCaret,
+                    sciCleaned = Text.Replace(Text.Replace(Text.Replace(Text.Replace(Text.Replace(parts, "×", "e"), "x10^", "e"), "*10^", "e"), "*10", "e"), " x10", "e"),
+                    cleaned = if Text.Contains(sciCleaned, ",") and not Text.Contains(sciCleaned, ".")
+                              then Text.Replace(Text.Remove(sciCleaned, {" "}), ",", ".")
+                              else Text.Replace(Text.Remove(sciCleaned, {" "}), ",", ""),
+                    asNumber = try Number.FromText(cleaned) otherwise null
+                in
+                    asNumber,
+            
+            // Helper: Determines if the extracted text contains scientific notation.
+            IsScientificText = (txt as text) as logical =>
+                let
+                    CleanText = Text.Trim(txt),
+                    Indicators = {"e-", "e+", "×10-", "× 10-", "*10-", "* 10-", "x10-", "x 10-", " x10-", " x10-", "^10-", "^ 10-"}
+                in
+                    List.AnyTrue(List.Transform(Indicators, each Text.Contains(CleanText, _))),
+            
+            // Helper: Build a dynamic regex that extracts a number (or range) immediately
+            // to the left or right of the provided unit (the matched phrase) based on the search direction.
+            ExtractFullTextFromSource = (source as text, phrase as nullable text, optional direction as text) as nullable record =>
+                let
+                    Cleaned = Text.Trim(Text.Replace(Text.Replace(source, "#(lf)", " "), ",", "")),
+                    p = if phrase = null then null else Text.Trim(phrase),
+                    baseNumberPattern = "[+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?",
+                    rangePattern = "(" & baseNumberPattern & ")(?:\s*(?:[-–—]|±)\s*(" & baseNumberPattern & "))?",
+                    actualDirection = if direction <> null then Text.Lower(Text.Trim(direction)) else "left",
+                    pattern = 
+                        if actualDirection = "left" then
+                            rangePattern & "[ \t]*(\[)?" & p
+                        else if actualDirection = "right" then
+                            p & "[ \t]*(\[)?" & rangePattern
+                        else
+                            rangePattern & "[ \t]*(\[)?" & p,
+                    match = try RegexMatch(Cleaned, pattern, "i") otherwise null,
+                    fullText = if match <> null and List.Count(match) > 0 then match{0} else null,
+                    TrimTrailingCharacters = (s as text, unwanted as list) as text =>
+                        if s = "" then ""
+                        else if List.Contains(unwanted, Text.End(s, 1)) then @TrimTrailingCharacters(Text.Start(s, Text.Length(s)-1), unwanted) else s,
+                    cleanedFullText = if fullText <> null then TrimTrailingCharacters(fullText, {"*", "]", ")", "."}) else null
+                in
+                    [ExtractedText = cleanedFullText, RegexPattern = pattern],
+            
+            // Helper: Derive the numeric value (and its range) from the full extracted text.
+            // Insertion: This block extracts the range (if present) using GetRangeFromExtractedText or ± processing.
+            DeriveValueAndRange = (fullText as text) as record =>
+                let
+                    hasPlusMinus = Text.Contains(fullText, "±"),
+                    provisional =
+                        if hasPlusMinus then
+                            let
+                                mainValText = GetNumericPortion(Text.Trim(Text.BeforeDelimiter(fullText, "±"))),
+                                uncertaintyText = GetNumericPortion(Text.Trim(Text.AfterDelimiter(fullText, "±"))),
+                                mainVal = NormalizeFinalNumber(mainValText),
+                                uncertaintyVal = NormalizeFinalNumber(uncertaintyText),
+                                rangeText = if mainVal <> null and uncertaintyVal <> null then Number.ToText(mainVal - uncertaintyVal) & "-" & Number.ToText(mainVal + uncertaintyVal) else null,
+                                extractedValue = if mainVal <> null then Text.From(mainVal) else null
+                            in
+                                [ ExtractedValue = extractedValue, ExtractedRange = rangeText, ExtractedNumber = mainVal ]
+                        else
+                            let
+                                valText = GetNumericPortion(fullText),
+                                mainVal = NormalizeFinalNumber(valText),
+                                rangeText = GetRangeFromExtractedText(fullText)
+                            in
+                                [ ExtractedValue = valText, ExtractedRange = rangeText, ExtractedNumber = mainVal ],
+                    finalRange = if IsScientificText(fullText) then null else provisional[ExtractedRange]
+                in
+                    [ ExtractedValue = provisional[ExtractedValue],
+                      ExtractedRange = finalRange,
+                      ExtractedNumber = provisional[ExtractedNumber] ],
+            
+            // Extraction Block for a single set.
+            ExtractValueBlock = (source as text, matched as nullable text, direction as text) as record =>
+                if matched = null then
+                    [ ExtractedText = null, RegexUsed = null, ExtractedValue = null, IsScientific = null, ExtractedRange = null, ExtractedNumber = null ]
+                else
                     let
-                        numMatch = try RegexMatch(txt, "^[+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?") otherwise null,
-                        numText = if numMatch <> null and List.Count(numMatch) > 0 then numMatch{0} else ""
+                        fullTextRecord = ExtractFullTextFromSource(source, matched, direction),
+                        fullText = fullTextRecord[ExtractedText],
+                        regexUsed = fullTextRecord[RegexPattern],
+                        valueAndRange = if fullText <> null then DeriveValueAndRange(fullText) else [ ExtractedValue = null, ExtractedRange = null, ExtractedNumber = null ],
+                        newValue = valueAndRange[ExtractedValue],
+                        num = valueAndRange[ExtractedNumber],
+                        rangeText = valueAndRange[ExtractedRange],
+                        isSci = if num <> null then IsScientificText(fullText) else false
                     in
-                        Text.Trim(numText),
-                
-                // Helper: If the text contains a range then return it as "number1-number2".
-                GetRangeFromExtractedText = (extractedText as text) as nullable text =>
-                    let
-                        Cleaned = Text.Trim(extractedText),
-                        pattern = "([+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)[\s]*[-–—][\s]*([+-]?\d+(?:[.,]\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?)",
-                        match = try RegexMatch(Cleaned, pattern, "i") otherwise null
-                    in
-                        if match <> null and List.Count(match) > 2 then match{1} & "-" & match{2} else null,
-                
-                // Helper: Normalize a number that may be expressed in scientific notation.
-                NormalizeFinalNumber = (valueText as nullable text) as nullable number =>
-                    let
-                        raw = if valueText = null then null else Text.Trim(valueText),
-                        rawNoCaret = if raw <> null then Text.Replace(raw, "^", "") else raw,
-                        parts =
-                            if rawNoCaret <> null and Text.Contains(rawNoCaret, "10") and List.AnyTrue({Text.Contains(rawNoCaret, "×"), Text.Contains(rawNoCaret, "x"), Text.Contains(rawNoCaret, "*")})
-                            then
-                                let
-                                    separators = {"×", "*", "x"},
-                                    found = List.First(List.Select(separators, each Text.Contains(rawNoCaret, _)), null),
-                                    split1 = if found <> null then Text.Split(rawNoCaret, found) else {rawNoCaret},
-                                    mainPart = if List.Count(split1) = 2 then Text.Trim(split1{0}) else rawNoCaret,
-                                    split2Raw = if List.Count(split1) = 2 then Text.Trim(split1{1}) else "",
-                                    split2Clean = Text.Replace(split2Raw, "^", ""),
-                                    split2 = Text.Split(split2Clean, "10"),
-                                    exponent = if List.Count(split2) = 2 then Text.Trim(split2{1}) else null,
-                                    recombined = if exponent <> null then mainPart & "e" & exponent else rawNoCaret
-                                in
-                                    recombined
-                            else
-                                rawNoCaret,
-                        sciCleaned = Text.Replace(Text.Replace(Text.Replace(Text.Replace(Text.Replace(parts, "×", "e"), "x10^", "e"), "*10^", "e"), "*10", "e"), " x10", "e"),
-                        cleaned = if Text.Contains(sciCleaned, ",") and not Text.Contains(sciCleaned, ".")
-                                  then Text.Replace(Text.Remove(sciCleaned, {" "}), ",", ".")
-                                  else Text.Replace(Text.Remove(sciCleaned, {" "}), ",", ""),
-                        asNumber = try Number.FromText(cleaned) otherwise null
-                    in
-                        asNumber,
-                
-                // Helper: Determines if the extracted text contains scientific notation.
-                IsScientificText = (txt as text) as logical =>
-                    let
-                        CleanText = Text.Trim(txt),
-                        Indicators = {"e-", "e+", "×10-", "× 10-", "*10-", "* 10-", "x10-", "x 10-", " x10-", " x10-", "^10-", "^ 10-"}
-                    in
-                        List.AnyTrue(List.Transform(Indicators, each Text.Contains(CleanText, _))),
-                
-                // Helper: Build a dynamic regex that extracts a number (or range) immediately
-                // to the left or right of the provided unit based on the search direction.
-                ExtractFullTextFromSource = (source as text, phrase as nullable text, optional direction as text) as nullable record =>
-                    let
-                        Cleaned = Text.Trim(Text.Replace(Text.Replace(source, "#(lf)", " "), ",", "")),
-                        p = if phrase = null then null else Text.Trim(phrase),
-                        baseNumberPattern = "[+-]?\d+(?:\.\d+)?(?:\s*(?:[eE][-+]?\d+|[×x*]\s*10\^?[-+]?\d+))?",
-                        rangePattern = "(" & baseNumberPattern & ")(?:\s*(?:[-–—]|±)\s*(" & baseNumberPattern & "))?",
-                        actualDirection = if direction <> null then Text.Lower(Text.Trim(direction)) else "left",
-                        pattern = 
-                            if actualDirection = "left" then
-                                rangePattern & "[ \t]*(\[)?" & p
-                            else if actualDirection = "right" then
-                                p & "[ \t]*(\[)?" & rangePattern
-                            else
-                                rangePattern & "[ \t]*(\[)?" & p,
-                        match = try RegexMatch(Cleaned, pattern, "i") otherwise null,
-                        fullText = if match <> null and List.Count(match) > 0 then match{0} else null,
-                        TrimTrailingCharacters = (s as text, unwanted as list) as text =>
-                            if s = "" then ""
-                            else if List.Contains(unwanted, Text.End(s, 1)) then @TrimTrailingCharacters(Text.Start(s, Text.Length(s)-1), unwanted) else s,
-                        cleanedFullText = if fullText <> null then TrimTrailingCharacters(fullText, {"*", "]", ")", "."}) else null
-                    in
-                        [ExtractedText = cleanedFullText, RegexPattern = pattern],
-                
-                // Helper: Derive the numeric value (and its range) from the full extracted text.
-                DeriveValueAndRange = (fullText as text) as record =>
-                    let
-                        hasPlusMinus = Text.Contains(fullText, "±"),
-                        provisional =
-                            if hasPlusMinus then
-                                let
-                                    mainValText = GetNumericPortion(Text.Trim(Text.BeforeDelimiter(fullText, "±"))),
-                                    uncertaintyText = GetNumericPortion(Text.Trim(Text.AfterDelimiter(fullText, "±"))),
-                                    mainVal = NormalizeFinalNumber(mainValText),
-                                    uncertaintyVal = NormalizeFinalNumber(uncertaintyText),
-                                    rangeText = if mainVal <> null and uncertaintyVal <> null then Number.ToText(mainVal - uncertaintyVal) & "-" & Number.ToText(mainVal + uncertaintyVal) else null,
-                                    extractedValue = if mainVal <> null then Text.From(mainVal) else null
-                                in
-                                    [ ExtractedValue = extractedValue, ExtractedRange = rangeText, ExtractedNumber = mainVal ]
-                            else
-                                let
-                                    valText = GetNumericPortion(fullText),
-                                    mainVal = NormalizeFinalNumber(valText),
-                                    rangeText = GetRangeFromExtractedText(fullText)
-                                in
-                                    [ ExtractedValue = valText, ExtractedRange = rangeText, ExtractedNumber = mainVal ],
-                        finalRange = if IsScientificText(fullText) then null else provisional[ExtractedRange]
-                    in
-                        [ ExtractedValue = provisional[ExtractedValue],
-                          ExtractedRange = finalRange,
-                          ExtractedNumber = provisional[ExtractedNumber] ],
-                
-                // Extraction Block for a single set.
-                ExtractValueBlock = (source as text, matched as nullable text, direction as text) as record =>
-                    if matched = null then
-                        [ ExtractedText = null, RegexUsed = null, ExtractedValue = null, IsScientific = null, ExtractedRange = null, ExtractedNumber = null ]
-                    else
-                        let
-                            fullTextRecord = ExtractFullTextFromSource(source, matched, direction),
-                            fullText = fullTextRecord[ExtractedText],
-                            regexUsed = fullTextRecord[RegexPattern],
-                            valueAndRange = if fullText <> null then DeriveValueAndRange(fullText) else [ ExtractedValue = null, ExtractedRange = null, ExtractedNumber = null ],
-                            newValue = valueAndRange[ExtractedValue],
-                            num = valueAndRange[ExtractedNumber],
-                            rangeText = valueAndRange[ExtractedRange],
-                            isSci = if num <> null then IsScientificText(fullText) else false
-                        in
-                            if num = null then
-                                [ ExtractedText = fullText, RegexUsed = regexUsed, ExtractedValue = newValue, IsScientific = isSci, ExtractedRange = rangeText, ExtractedNumber = num ]
-                            else
-                                [ ExtractedText = fullText, RegexUsed = regexUsed, ExtractedValue = newValue, IsScientific = isSci, ExtractedRange = rangeText, ExtractedNumber = num ],
-                
-                ValueBlock1 = ExtractValueBlock(CleanTargetText, fuzzyMatchResult[MatchedPhrase1], direction1),
-                ValueBlock2 = if fuzzyMatchResult[MatchedPhrase2] = null then
-                                [ ExtractedText = null, RegexUsed = null, ExtractedValue = null, IsScientific = null, ExtractedRange = null, ExtractedNumber = null ]
-                              else
-                                ExtractValueBlock(CleanTargetText, fuzzyMatchResult[MatchedPhrase2], direction2),
-                fuzzyExtractResult = [
-                    ExtractedText1 = ValueBlock1[ExtractedText],
-                    RegexUsed1 = ValueBlock1[RegexUsed],
-                    ExtractedValue1 = ValueBlock1[ExtractedValue],
-                    IsScientific1 = ValueBlock1[IsScientific],
-                    ExtractedRange1 = ValueBlock1[ExtractedRange],
-                    ExtractedNumber1 = ValueBlock1[ExtractedNumber],
-                    ExtractedText2 = ValueBlock2[ExtractedText],
-                    RegexUsed2 = ValueBlock2[RegexUsed],
-                    ExtractedValue2 = ValueBlock2[ExtractedValue],
-                    IsScientific2 = ValueBlock2[IsScientific],
-                    ExtractedRange2 = ValueBlock2[ExtractedRange],
-                    ExtractedNumber2 = ValueBlock2[ExtractedNumber]
-                ]
-            in
-                fuzzyExtractResult,
+                        if num = null then
+                            [ ExtractedText = fullText, RegexUsed = regexUsed, ExtractedValue = newValue, IsScientific = isSci, ExtractedRange = rangeText, ExtractedNumber = num ]
+                        else
+                            [ ExtractedText = fullText, RegexUsed = regexUsed, ExtractedValue = newValue, IsScientific = isSci, ExtractedRange = rangeText, ExtractedNumber = num ],
+            
+            ValueBlock1 = ExtractValueBlock(CleanTargetText, fuzzyMatchResult[MatchedPhrase1], direction1),
+            ValueBlock2 = if fuzzyMatchResult[MatchedPhrase2] = null then
+                            [ ExtractedText = null, RegexUsed = null, ExtractedValue = null, IsScientific = null, ExtractedRange = null, ExtractedNumber = null ]
+                          else
+                            ExtractValueBlock(CleanTargetText, fuzzyMatchResult[MatchedPhrase2], direction2),
+            fuzzyExtractResult = [
+                ExtractedText1 = ValueBlock1[ExtractedText],
+                RegexUsed1 = ValueBlock1[RegexUsed],
+                ExtractedValue1 = ValueBlock1[ExtractedValue],
+                IsScientific1 = ValueBlock1[IsScientific],
+                ExtractedRange1 = ValueBlock1[ExtractedRange],
+                ExtractedNumber1 = ValueBlock1[ExtractedNumber],
+                ExtractedText2 = ValueBlock2[ExtractedText],
+                RegexUsed2 = ValueBlock2[RegexUsed],
+                ExtractedValue2 = ValueBlock2[ExtractedValue],
+                IsScientific2 = ValueBlock2[IsScientific],
+                ExtractedRange2 = ValueBlock2[ExtractedRange],
+                ExtractedNumber2 = ValueBlock2[ExtractedNumber]
+            ]
+        in
+            fuzzyExtractResult,
     
     // ***************** Conversion Block (fnConvertValue) *****************
     convertResult = 
@@ -365,29 +366,31 @@ let
             finalConvertResult,
     
     // ***************** Combine All Results *****************
-    finalResult = [
-        SearchedPhrase1 = fuzzyMatchResult[SearchedPhrase1],
-        MatchedPhrase1 = fuzzyMatchResult[MatchedPhrase1],
-        ReturnedPhrase1 = fuzzyMatchResult[ReturnedPhrase1],
-        Similarity1 = fuzzyMatchResult[Similarity1],
-        SearchedPhrase2 = fuzzyMatchResult[SearchedPhrase2],
-        MatchedPhrase2 = fuzzyMatchResult[MatchedPhrase2],
-        ReturnedPhrase2 = fuzzyMatchResult[ReturnedPhrase2],
-        Similarity2 = fuzzyMatchResult[Similarity2],
-        ExtractedText1 = fuzzyExtractResult[ExtractedText1],
-        RegexUsed1 = fuzzyExtractResult[RegexUsed1],
-        ExtractedValue1 = fuzzyExtractResult[ExtractedValue1],
-        IsScientific1 = fuzzyExtractResult[IsScientific1],
-        ExtractedNumber1 = fuzzyExtractResult[ExtractedNumber1],
-        ExtractedText2 = fuzzyExtractResult[ExtractedText2],
-        RegexUsed2 = fuzzyExtractResult[RegexUsed2],
-        ExtractedValue2 = fuzzyExtractResult[ExtractedValue2],
-        IsScientific2 = fuzzyExtractResult[IsScientific2],
-        ExtractedNumber2 = fuzzyExtractResult[ExtractedNumber2],
-        ConversionUsed1 = convertResult[ConversionUsed1],
-        ConversionNumber1 = convertResult[ConversionNumber1],
-        ConversionUsed2 = convertResult[ConversionUsed2],
-        ConversionNumber2 = convertResult[ConversionNumber2]
-    ]
+finalResult = [
+    SearchedPhrase1 = fuzzyMatchResult[SearchedPhrase1],
+    MatchedPhrase1 = fuzzyMatchResult[MatchedPhrase1],
+    ReturnedPhrase1 = fuzzyMatchResult[ReturnedPhrase1],
+    Similarity1 = fuzzyMatchResult[Similarity1],
+    SearchedPhrase2 = fuzzyMatchResult[SearchedPhrase2],
+    MatchedPhrase2 = fuzzyMatchResult[MatchedPhrase2],
+    ReturnedPhrase2 = fuzzyMatchResult[ReturnedPhrase2],
+    Similarity2 = fuzzyMatchResult[Similarity2],
+    ExtractedText1 = fuzzyExtractResult[ExtractedText1],
+    RegexUsed1 = fuzzyExtractResult[RegexUsed1],
+    ExtractedValue1 = fuzzyExtractResult[ExtractedValue1],
+    IsScientific1 = fuzzyExtractResult[IsScientific1],
+    ExtractedRange1 = fuzzyExtractResult[ExtractedRange1],
+    ExtractedNumber1 = fuzzyExtractResult[ExtractedNumber1],
+    ExtractedText2 = fuzzyExtractResult[ExtractedText2],
+    RegexUsed2 = fuzzyExtractResult[RegexUsed2],
+    ExtractedValue2 = fuzzyExtractResult[ExtractedValue2],
+    IsScientific2 = fuzzyExtractResult[IsScientific2],
+    ExtractedRange2 = fuzzyExtractResult[ExtractedRange2],
+    ExtractedNumber2 = fuzzyExtractResult[ExtractedNumber2],
+    ConversionUsed1 = convertResult[ConversionUsed1],
+    ConversionNumber1 = convertResult[ConversionNumber1],
+    ConversionUsed2 = convertResult[ConversionUsed2],
+    ConversionNumber2 = convertResult[ConversionNumber2]
+]
 in
     finalResult
